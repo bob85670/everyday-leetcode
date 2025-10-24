@@ -232,7 +232,10 @@ def load_progress():
     # Initialize progress for all problems
     progress = {
         "last_run": None,
-        "category_index": 0  # Start with Arrays & Hashing
+        "category_index": 0,
+        "pending_problems": [],
+        "cycle_count": 0,
+        "cycle_start_date": None
     }
     for category, problems in PROBLEMS.items():
         for problem in problems:
@@ -244,7 +247,8 @@ def load_progress():
                 "next_review": datetime.datetime.now().date().isoformat(),
                 "success_count": 0,
                 "fail_count": 0,
-                "interval_days": 7  # Initial interval: 1 week
+                "interval_days": 7,
+                "cycle_completed_count": 0  # Track completions per cycle
             }
     return progress
 
@@ -259,12 +263,11 @@ def check_missed_days(progress, today):
     last_run = datetime.date.fromisoformat(progress["last_run"])
     if last_run >= today:
         return
-    # Check each day from last_run + 1 to today
     current = last_run + datetime.timedelta(days=1)
     while current <= today:
-        if current.weekday() < 5:  # Only process weekdays
+        if current.weekday() < 5:
             for pid, data in progress.items():
-                if pid in ["last_run", "category_index"]:
+                if pid in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"]:
                     continue
                 next_review = datetime.date.fromisoformat(data["next_review"])
                 if next_review <= current:
@@ -274,10 +277,9 @@ def check_missed_days(progress, today):
 def get_due_problems(progress, today):
     due = []
     for pid, data in progress.items():
-        if pid in ["last_run", "category_index"]:
+        if pid in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"]:
             continue
         next_review = datetime.date.fromisoformat(data["next_review"])
-        # Exclude problems attempted today
         last_attempted = data.get("last_attempted")
         if last_attempted and last_attempted == today.isoformat():
             continue
@@ -285,71 +287,144 @@ def get_due_problems(progress, today):
             due.append((pid, data["category"], data["name"]))
     return due
 
+def pull_future_problems(progress, today, current_due, max_problems=4):
+    """Pull future problems to today if fewer than max_problems are due."""
+    future_problems = []
+    for pid, data in progress.items():
+        if pid in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"]:
+            continue
+        if (pid, data["category"], data["name"]) not in current_due:
+            next_review = datetime.date.fromisoformat(data["next_review"])
+            if next_review > today:
+                future_problems.append((pid, data["category"], data["name"], next_review))
+    
+    # Sort by earliest review date
+    future_problems.sort(key=lambda x: x[3])
+    
+    # Pull problems to fill up to max_problems
+    pulled = []
+    for pid, category, name, _ in future_problems:
+        if len(current_due) + len(pulled) < max_problems:
+            progress[pid]["next_review"] = today.isoformat()
+            pulled.append((pid, category, name))
+            # Shift subsequent problems forward
+            next_date = get_next_weekday(today)
+            for subsequent_pid, data in progress.items():
+                if subsequent_pid in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"]:
+                    continue
+                next_review = datetime.date.fromisoformat(data["next_review"])
+                if next_review == today:
+                    data["next_review"] = next_date.isoformat()
+        else:
+            break
+    return pulled
+
 def select_category(due_problems, today, progress):
     # Group due problems by category
     categories = defaultdict(list)
     for pid, category, name in due_problems:
         categories[category].append((pid, name))
     
-    if not categories:
-        return None, []
+    total_problems = sum(len(problems) for problems in PROBLEMS.values())
+    remaining_problems = sum(1 for pid, data in progress.items() 
+                            if pid not in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"] 
+                            and data["cycle_completed_count"] == progress.get("cycle_count", 0))
     
-    # Use stored category_index
-    category_index = progress.get("category_index", 0)
-    selected_category = CATEGORY_ORDER[category_index]
+    # If 4 or fewer problems remain in the cycle, only select those
+    max_problems = min(4, remaining_problems)
     
-    # Get problems from selected category, or next available if none
-    problems = categories.get(selected_category, [])
-    if not problems:
-        # Find the next category with due problems
-        for i in range(1, len(CATEGORY_ORDER)):
-            next_category = CATEGORY_ORDER[(category_index + i) % len(CATEGORY_ORDER)]
-            if next_category in categories:
-                selected_category = next_category
-                problems = categories[selected_category]
-                break
+    if not categories and not progress.get("pending_problems"):
+        return None, [], max_problems
+    
+    # Prioritize pending problems from the previous session
+    pending = progress.get("pending_problems", [])
+    selected_problems = []
+    selected_category = None
+    
+    if pending:
+        selected_category = progress[pending[0]]["category"]
+        selected_problems = [(pid, progress[pid]["name"]) for pid in pending]
+        progress["pending_problems"] = []
+    
+    if len(selected_problems) < max_problems:
+        category_index = progress.get("category_index", 0)
+        next_category = CATEGORY_ORDER[category_index]
+        
+        problems = categories.get(next_category, [])
         if not problems:
-            return None, []
+            for i in range(1, len(CATEGORY_ORDER)):
+                next_category = CATEGORY_ORDER[(category_index + i) % len(CATEGORY_ORDER)]
+                if next_category in categories:
+                    problems = categories[next_category]
+                    break
+        
+        problems.sort(key=lambda x: progress[x[0]].get("fail_count", 0), reverse=True)
+        
+        remaining_slots = max_problems - len(selected_problems)
+        selected_problems.extend(problems[:remaining_slots])
+        
+        for pid, _ in problems[remaining_slots:]:
+            progress[pid]["next_review"] = get_next_weekday(today).isoformat()
+        
+        if not selected_category and selected_problems:
+            selected_category = progress[selected_problems[0][0]]["category"]
+        
+        progress["category_index"] = (category_index + 1) % len(CATEGORY_ORDER)
     
-    # Sort problems by fail count to prioritize weaker areas
-    problems.sort(key=lambda x: progress[x[0]].get("fail_count", 0), reverse=True)
-    
-    # Limit to 7 problems, reschedule excess to next weekday
-    selected_problems = problems[:7]
-    for pid, _ in problems[7:]:
-        progress[pid]["next_review"] = get_next_weekday(today).isoformat()
-    
-    # Increment category_index for next run
-    progress["category_index"] = (category_index + 1) % len(CATEGORY_ORDER)
-    
-    return selected_category, selected_problems
+    return selected_category, selected_problems, max_problems
 
 def schedule_problem(progress, pid, success, today):
     data = progress[pid]
     data["last_attempted"] = today.isoformat()
     if success:
         data["success_count"] += 1
-        # Double interval after first success
+        data["cycle_completed_count"] += 1
         data["interval_days"] = 7 if data["success_count"] == 1 else data["interval_days"] * 2
         next_review = today + datetime.timedelta(days=data["interval_days"])
-        # Ensure next review is a weekday
         data["next_review"] = get_next_weekday(next_review - datetime.timedelta(days=1)).isoformat()
     else:
         data["fail_count"] += 1
         next_review = today + datetime.timedelta(days=2)
-        # Ensure next review is a weekday
         data["next_review"] = get_next_weekday(next_review - datetime.timedelta(days=1)).isoformat()
+
+def check_cycle_completion(progress, today):
+    total_problems = sum(len(problems) for problems in PROBLEMS.values())
+    completed = sum(1 for pid, data in progress.items() 
+                    if pid not in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"] 
+                    and data["cycle_completed_count"] > progress.get("cycle_count", 0))
+    
+    if completed == total_problems:
+        cycle_start = datetime.date.fromisoformat(progress["cycle_start_date"]) if progress.get("cycle_start_date") else today
+        time_taken = (today - cycle_start).days
+        print(f"\nCycle {progress['cycle_count'] + 1} completed!")
+        print(f"Time taken: {time_taken} days")
+        
+        # Find top 5 worst-performing questions
+        problems = [(pid, data["name"], data["fail_count"]) 
+                    for pid, data in progress.items() 
+                    if pid not in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"]]
+        problems.sort(key=lambda x: x[2], reverse=True)
+        print("\nTop 5 worst-performing questions:")
+        for i, (pid, name, fail_count) in enumerate(problems[:5], 1):
+            print(f"{i}. LeetCode #{pid}: {name} (Failed {fail_count} times)")
+        
+        # Start new cycle
+        progress["cycle_count"] = progress.get("cycle_count", 0) + 1
+        progress["cycle_start_date"] = get_next_weekday(today).isoformat()
+        for pid, data in progress.items():
+            if pid in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"]:
+                continue
+            data["next_review"] = progress["cycle_start_date"]
+            data["interval_days"] = 7
 
 def main():
     today = datetime.datetime.now().date()
-    # Ensure today is a weekday
     if today.weekday() >= 5:
         print("Program only runs on weekdays. Please run on Monday-Friday.")
         return
     
     progress = load_progress()
     
-    # Check for 2-week gap
     if progress.get("last_run"):
         last_run = datetime.date.fromisoformat(progress["last_run"])
         if (today - last_run).days >= 14:
@@ -361,7 +436,10 @@ def main():
             if response == 'n':
                 progress = {
                     "last_run": None,
-                    "category_index": 0
+                    "category_index": 0,
+                    "pending_problems": [],
+                    "cycle_count": 0,
+                    "cycle_start_date": today.isoformat()
                 }
                 for category, problems in PROBLEMS.items():
                     for problem in problems:
@@ -373,32 +451,45 @@ def main():
                             "next_review": today.isoformat(),
                             "success_count": 0,
                             "fail_count": 0,
-                            "interval_days": 7
+                            "interval_days": 7,
+                            "cycle_completed_count": 0
                         }
     
-    # Update last run date and check for missed days
     check_missed_days(progress, today)
     progress["last_run"] = today.isoformat()
+    if not progress.get("cycle_start_date"):
+        progress["cycle_start_date"] = today.isoformat()
     
-    # Get due problems
     due_problems = get_due_problems(progress, today)
-    if not due_problems:
+    remaining_problems = sum(1 for pid, data in progress.items() 
+                            if pid not in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"] 
+                            and data["cycle_completed_count"] == progress.get("cycle_count", 0))
+    
+    if remaining_problems <= 4:
+        due_problems = [(pid, data["category"], data["name"]) 
+                        for pid, data in progress.items() 
+                        if pid not in ["last_run", "category_index", "pending_problems", "cycle_count", "cycle_start_date"] 
+                        and data["cycle_completed_count"] == progress.get("cycle_count", 0)]
+    else:
+        if len(due_problems) + len(progress.get("pending_problems", [])) < 4:
+            due_problems.extend(pull_future_problems(progress, today, due_problems))
+    
+    if not due_problems and not progress.get("pending_problems"):
         print("No problems due today.")
         return
     
-    # Select category and problems
-    category, selected_problems = select_category(due_problems, today, progress)
+    category, selected_problems, max_problems = select_category(due_problems, today, progress)
     if not selected_problems:
         print("No problems due today.")
         return
     
     print(f"\nToday's category: {category}")
-    print("Problems to solve today (up to 7):")
+    print(f"Problems to solve today (up to {max_problems}):")
     for i, (pid, name) in enumerate(selected_problems, 1):
         print(f"{i}. LeetCode #{pid}: {name}")
     
-    # Get user input for solve outcomes
     print("\nEnter solve outcomes (y for success, n for failure, q to quit):")
+    pending = []
     for pid, name in selected_problems:
         while True:
             response = input(f"Did you solve LeetCode #{pid}: {name}? (y/n/q): ").lower()
@@ -407,11 +498,18 @@ def main():
             print("Please enter 'y', 'n', or 'q'.")
         
         if response == 'q':
+            pending.append(pid)
+            pending.extend(p[0] for p in selected_problems[selected_problems.index((pid, name))+1:])
             break
         success = response == 'y'
         schedule_problem(progress, pid, success, today)
     
-    # Save progress
+    if pending:
+        progress["pending_problems"] = pending
+        for pid in pending:
+            progress[pid]["next_review"] = get_next_weekday(today).isoformat()
+    
+    check_cycle_completion(progress, today)
     save_progress(progress)
 
 if __name__ == "__main__":
